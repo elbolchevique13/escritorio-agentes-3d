@@ -1,0 +1,4 @@
+✔ 11. POST /stream com o mesmo id atualiza o trecho, nao duplica (30.5254ms)
+✔ 12. 201 trechos no mesmo slug mantem 200 e o mais antigo sai (419.4618ms)
+✔ 13. texto em branco responde ignorado e nao cria trecho (9.003ms)
+✔ 14. hook do opencode: reasoning cria trecho com o texto real da parte (4.3982ms)
