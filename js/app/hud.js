@@ -2,6 +2,9 @@
 import { config } from './config.js';
 import { beep, SONS, notificar, ligarSom } from './avisos.js';
 import { janela, responder, fora } from './conexao.js';
+import { iniciarKanban } from './kanban.js';
+import { iniciarSom } from './som.js';
+import { iniciarStream } from './stream.js';
 
 const $ = (id) => document.getElementById(id);
 const fmtK = (n) => n >= 100000 ? Math.round(n / 1000) + 'K' : n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n);
@@ -11,6 +14,7 @@ export const NOMES = { plan: 'Auditor', build: 'Construtor' };
 const prev = { plan: 'idle', build: 'idle' };
 const inicio = { plan: 0, build: 0 };
 let ultimaDur = 0, atual = null, acoesHud = {}, chavePedidos = '';
+let overlays = {}, overlayAberto = null;
 const local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname); // no celular a janela do PC nao e controlada
 
 // icone do kind no chat (o mesmo kind que pinta o balao e o telao)
@@ -56,6 +60,11 @@ export function mostrar(s) {
   janelaBotoes(s.janela);
   $('bFora').hidden = !s.remoto;
   $('bFora').classList.toggle('on', !!s.fora);
+  if (overlays.kanban) {
+    overlays.kanban.api.mostrar(s.kanban);
+    overlays.som.api.mostrar(s.som);
+    overlays.stream.api.mostrar(s.stream, s.subs || [], s.agents);
+  }
 }
 
 // permissoes esperando resposta: permitir, sempre permitir ou negar (no PC ou no celular)
@@ -192,9 +201,48 @@ function janelaBotoes(w) {
   $('bPin').classList.toggle('on', !!(w && w.pinned));
 }
 
+// um overlay por vez: kanban, som ou stream. Esc e o × fecham e devolvem o foco ao botao.
+function fecharOverlay(foco) {
+  const era = overlayAberto;
+  for (const o of Object.values(overlays)) {
+    o.el.hidden = true;
+    o.botao.classList.remove('on');
+    o.botao.setAttribute('aria-expanded', 'false');
+  }
+  overlayAberto = null;
+  if (foco && era && overlays[era]) overlays[era].botao.focus({ preventScroll: true });
+}
+
+function alternarOverlay(nome) {
+  const o = overlays[nome];
+  if (!o) return;
+  if (overlayAberto === nome) return fecharOverlay(true);
+  fecharOverlay(false);
+  o.el.hidden = false;
+  o.botao.classList.add('on');
+  o.botao.setAttribute('aria-expanded', 'true');
+  overlayAberto = nome;
+  if (nome === 'stream') o.api.aoAbrir();
+  const f = o.el.querySelector('.fechar');
+  if (f) f.focus({ preventScroll: true });
+}
+
 // liga os botoes do topo; acoes que dependem da cena 3D chegam por "acoes"
 export function iniciarHud(acoes) {
   acoesHud = acoes;
+  overlays = {
+    kanban: { el: $('kanban'), botao: $('bKanban'), api: iniciarKanban($('kanban')) },
+    som: { el: $('jukebox'), botao: $('bJukebox'), api: iniciarSom($('jukebox')) },
+    stream: { el: $('stream'), botao: $('bStream'), api: iniciarStream($('stream')) },
+  };
+  for (const [nome, o] of Object.entries(overlays)) {
+    o.botao.addEventListener('click', () => alternarOverlay(nome));
+    const f = o.el.querySelector('.fechar');
+    if (f) f.addEventListener('click', () => fecharOverlay(true));
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && overlayAberto) { e.preventDefault(); fecharOverlay(true); }
+  });
   const bSound = $('bSound');
   bSound.classList.toggle('on', config.get('som'));
   bSound.addEventListener('click', async () => { await ligarSom(!config.get('som')); bSound.classList.toggle('on', config.get('som')); });
@@ -216,7 +264,7 @@ export function iniciarHud(acoes) {
   bQual.addEventListener('click', () => qual(config.get('qualidade') === 'alta' ? 'baixa' : 'alta'));
   bQual.querySelector('span').textContent = config.get('qualidade');
 
-  $('bLook').addEventListener('click', () => acoes.aparencia());
+  $('bLook').addEventListener('click', () => { fecharOverlay(false); acoes.aparencia(); });
   $('bDemo').addEventListener('click', () => acoes.demo());
 
   // tela estreita: o HUD fica numa gaveta embaixo; fecha ao tocar na cena, no Esc ou ao abrir algo por cima
@@ -230,7 +278,7 @@ export function iniciarHud(acoes) {
   bGaveta.addEventListener('click', () => gaveta(!document.body.classList.contains('gaveta-aberta')));
   document.addEventListener('pointerdown', (e) => { if (!hud.contains(e.target)) gaveta(false); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') gaveta(false); });
-  for (const id of ['bLook', 'bDemo', 'bHide']) $(id).addEventListener('click', () => gaveta(false));
+  for (const id of ['bLook', 'bDemo', 'bHide', 'bKanban', 'bJukebox', 'bStream']) $(id).addEventListener('click', () => gaveta(false));
 
   $('ctx').addEventListener('click', () => {
     const v = prompt('Limite de contexto do modelo, em tokens:', config.get('ctxLimite'));

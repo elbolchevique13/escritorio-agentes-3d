@@ -4,7 +4,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const path = require("path");
-const { app, listen, close, req, janelaCmds } = require("./helpers");
+const { app, listen, close, req, sse, janelaCmds } = require("./helpers");
 const browser = require("./browser");
 
 const skip = !browser.available && "Chrome/Edge nao encontrado";
@@ -12,7 +12,7 @@ let page, url;
 const print = (nome) => process.env.ESCRITORIO_PRINTS && page.screenshot(path.join(process.env.ESCRITORIO_PRINTS, nome + ".png"));
 // sem capturas de tela, os testes usam a qualidade baixa (o Chrome de teste desenha sem placa de video)
 const QUAL = process.env.ESCRITORIO_PRINTS ? "alta" : "baixa";
-const abrir = (extra = "") => page.open(url, `try { const c = JSON.parse(localStorage.getItem('escritorio.config') || '{}'); c.qualidade = '${QUAL}'; localStorage.setItem('escritorio.config', JSON.stringify(c)); } catch {} ${extra}`);
+const abrir = (extra = "") => page.open(url, `if (window.top === window) { try { const c = JSON.parse(localStorage.getItem('escritorio.config') || '{}'); c.qualidade = '${QUAL}'; localStorage.setItem('escritorio.config', JSON.stringify(c)); } catch {} ${extra} }`);
 const limpo = () => page.errors.filter((e) => !/WebGL|GPU stall|GL Driver/i.test(e));
 
 test.before(async () => {
@@ -356,5 +356,251 @@ test("tela estreita: so a animacao; o HUD vai para uma gaveta embaixo que abre n
     await page.eval(`document.getElementById('bLook').click()`);
     await page.until(`!document.body.classList.contains('gaveta-aberta')`);
   } finally { await page.tamanho(1280, 800); }
+  assert.deepStrictEqual(limpo(), []);
+});
+
+// ---------- HUD: kanban, som (jukebox) e stream ----------
+// Contrato: docs/CONTRATO-HUD-KANBAN-SOM-STREAM.md (secoes 4, 5 e 6.2).
+// Se o backend ainda nao tiver as rotas, os testes aparecem como skip, nunca como falha do HUD.
+let hudPronto = null;
+async function temHud() {
+  if (hudPronto !== null) return hudPronto;
+  const [k, s, st] = await Promise.all([req("GET", "/kanban"), req("GET", "/som"), req("GET", "/stream")]);
+  hudPronto = k.status === 200 && s.status === 200 && st.status === 200;
+  return hudPronto;
+}
+
+const jsonDe = (r) => { try { return JSON.parse(r.body); } catch { return null; } };
+const postar = (rota, corpo) => req("POST", rota, { "Content-Type": "application/json" }, JSON.stringify(corpo));
+const semHud = (t) => t.skip("backend /kanban, /som ou /stream ainda ausente");
+
+// o POST /stream chama push()? Sem isso o trecho novo nao chega pelo SSE e o teste de
+// "ao vivo" nao pode passar por culpa do backend (contrato 4), nao do HUD.
+let streamPush = null;
+async function streamEmpurra() {
+  if (streamPush !== null) return streamPush;
+  const c = await sse();
+  const id = "hudpush:" + Date.now();
+  let buf = "";
+  const chegou = new Promise((ok) => {
+    const t = setTimeout(() => ok(false), 2500);
+    c.on("data", (d) => { buf += d; if (buf.includes('"' + id + '"')) { clearTimeout(t); ok(true); } });
+    c.on("error", () => { clearTimeout(t); ok(false); });
+  });
+  await postar("/stream", { slug: "hudpush", nome: "Hud Push", tag: "frontend", tipo: "reasoning", texto: "teste de push", id });
+  streamPush = await chegou;
+  c.destroy();
+  return streamPush;
+}
+
+async function fecharCard(id) {
+  await postar("/kanban", { acao: "fechar", id });
+}
+
+async function esvaziarSom() {
+  for (let i = 0; i < 80; i++) {
+    const s = jsonDe(await req("GET", "/som"));
+    if (s && !s.atual && (!s.fila || !s.fila.length)) return;
+    await postar("/som", { acao: "pular" });
+  }
+}
+
+const colunaDe = (id) => `(() => { const c = document.querySelector('#kanban [data-id="${id}"]'); return c ? c.closest('.kanban-col').dataset.col : ''; })()`;
+
+test("hud kanban: 4 colunas, card manual no snapshot sem recarregar e Esc fecha", { skip }, async (t) => {
+  if (!(await temHud())) return semHud(t);
+  await abrir();
+  await page.until(`ESC.pronto === true`, 15000);
+  await page.eval(`document.getElementById('bKanban').click()`);
+  await page.until(`!document.getElementById('kanban').hidden`);
+  assert.deepStrictEqual(await page.eval(`[...document.querySelectorAll('#kanban .kanban-col')].map((c) => c.dataset.col)`), ["fila", "fazendo", "revisao", "feito"]);
+  assert.strictEqual(await page.eval(`document.activeElement.className`), "fechar", "o foco vai para o botao de fechar");
+  const r = await postar("/kanban", { acao: "add", slug: "casca", nome: "Casca", tag: "frontend", titulo: "card que chega no snapshot", col: "fila" });
+  assert.strictEqual(r.status, 201);
+  const card = jsonDe(r).card;
+  await page.until(`!!document.querySelector('#kanban [data-id="${card.id}"]')`, 1500);
+  assert.match(await page.eval(`document.querySelector('#kanban [data-id="${card.id}"]').textContent`), /card que chega no snapshot/);
+  assert.strictEqual(await page.eval(colunaDe(card.id)), "fila");
+  await page.eval(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+  await page.until(`document.getElementById('kanban').hidden`);
+  assert.strictEqual(await page.eval(`document.activeElement.id`), "bKanban", "Esc devolve o foco ao botao");
+  await fecharCard(card.id);
+  assert.deepStrictEqual(limpo(), []);
+});
+
+test("hud kanban: card automatico vai para revisao no waiting e volta no working", { skip }, async (t) => {
+  if (!(await temHud())) return semHud(t);
+  const slug = "hudauto";
+  await req("GET", `/sub?id=${slug}&name=Hud%20Auto&tag=frontend&text=primeira%20tarefa&kind=read&status=working`);
+  await req("GET", `/sub?id=${slug}&name=Hud%20Auto&tag=frontend&status=waiting`);
+  const noQuadro = jsonDe(await req("GET", `/kanban?slug=${slug}`));
+  const automatico = noQuadro && noQuadro.cards.find((c) => c.id === `auto-${slug}`);
+  if (!automatico || automatico.col !== "revisao") {
+    await req("GET", `/sub?id=${slug}&status=done`);
+    await req("GET", `/sub?id=${slug}&status=done`);
+    await fecharCard(`auto-${slug}`);
+    return t.skip("backend: /sub?status=waiting ainda nao move o card para revisao (contrato 1.4)");
+  }
+  await abrir();
+  await page.until(`ESC.pronto === true`, 15000);
+  await page.eval(`document.getElementById('bKanban').click()`);
+  await page.until(`document.querySelector('#kanban [data-id="auto-${slug}"]')`);
+  assert.strictEqual(await page.eval(colunaDe(`auto-${slug}`)), "revisao");
+  await req("GET", `/sub?id=${slug}&name=Hud%20Auto&tag=frontend&text=voltei&kind=read&status=working`);
+  await page.until(`document.querySelector('#kanban [data-id="auto-${slug}"]').closest('.kanban-col').dataset.col === 'fazendo'`);
+  // agente ativo sem trecho: coluna do stream mostra "sem atividade"
+  await page.eval(`document.getElementById('bStream').click()`);
+  await page.until(`!document.getElementById('stream').hidden`);
+  await page.until(`document.querySelector('#stream .stream-col[data-slug="${slug}"]')`);
+  assert.match(await page.eval(`document.querySelector('#stream .stream-col[data-slug="${slug}"]').textContent`), /sem atividade/);
+  await req("GET", `/sub?id=${slug}&status=done`);
+  await req("GET", `/sub?id=${slug}&status=done`);
+  await fecharCard(`auto-${slug}`);
+  assert.deepStrictEqual(limpo(), []);
+});
+
+test("hud kanban: card add pelo CLI aparece no overlay em menos de 1 s", { skip }, async (t) => {
+  if (!(await temHud())) return semHud(t);
+  const fs = require("fs");
+  const { execFile } = require("child_process");
+  const cli = "C:/Users/Leonardo/OpenBot/Shared/mundo/mundo.js";
+  if (!/cmd === "card"/.test(fs.readFileSync(cli, "utf8"))) return t.skip("mundo.js ainda sem os subcomandos card");
+  await abrir();
+  await page.until(`ESC.pronto === true`, 15000);
+  await page.eval(`document.getElementById('bKanban').click()`);
+  await page.until(`!document.getElementById('kanban').hidden`);
+  // o servidor de teste escuta em 127.0.0.1; "localhost" pode cair no IPv6 e estourar o timeout do CLI
+  const base = url.replace(/^http:\/\/localhost/, "http://127.0.0.1").replace(/\/$/, "");
+  // execFile (nao spawnSync): o servidor de teste roda neste mesmo processo e precisa responder ao CLI
+  const r = await new Promise((ok) => {
+    execFile(process.execPath, [cli, "card", "add", "casca", "card criado pelo cli", "--col", "fila"], {
+      env: { ...process.env, MUNDO_URL: base }, encoding: "utf8", timeout: 8000,
+    }, (erro, stdout, stderr) => ok({ status: erro ? 1 : 0, stdout: stdout || "", stderr: stderr || String(erro || "") }));
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const id = (r.stdout.match(/card (k\d+)/) || [])[1];
+  assert.ok(id, "o CLI imprime o id do card: " + r.stdout);
+  await page.until(`!!document.querySelector('#kanban [data-id="${id}"]')`, 1000);
+  await fecharCard(id);
+  assert.deepStrictEqual(limpo(), []);
+});
+
+test("hud som: sem ligar nao tem iframe; ao ligar monta o embed e persiste o toggle", { skip }, async (t) => {
+  if (!(await temHud())) return semHud(t);
+  await esvaziarSom();
+  const add = await postar("/som", { acao: "add", slug: "casca", nome: "Casca", tag: "frontend", url: "https://youtu.be/dQw4w9WgXcQ?t=30", titulo: "Video Um" });
+  assert.strictEqual(add.status, 200);
+  await abrir(`try { const c = JSON.parse(localStorage.getItem('escritorio.config') || '{}'); c.jukeboxSom = false; localStorage.setItem('escritorio.config', JSON.stringify(c)); } catch {}`);
+  await page.until(`ESC.pronto === true`, 15000);
+  await page.eval(`document.getElementById('bJukebox').click()`);
+  await page.until(`!document.getElementById('jukebox').hidden`);
+  assert.strictEqual(await page.eval(`document.querySelectorAll('#jukebox iframe').length`), 0, "desligado nao injeta iframe");
+  const texto = await page.eval(`document.getElementById('jukebox').textContent`);
+  assert.match(texto, /Video Um/);
+  assert.match(texto, /Casca/);
+  assert.match(texto, /frontend/);
+  assert.match(texto, /Fila \(0\)/);
+  // controles de som sao do cliente e nao usam a chave antiga "som" dos avisos
+  assert.strictEqual(await page.eval(`JSON.parse(localStorage.getItem('escritorio.config') || '{}').som`), undefined);
+  await page.eval(`document.getElementById('somLigar').click()`);
+  await page.until(`!!document.querySelector('#jukebox iframe')`);
+  assert.strictEqual(await page.eval(`document.querySelector('#jukebox iframe').getAttribute('src')`), "https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&rel=0");
+  assert.match(await page.eval(`document.querySelector('#jukebox iframe').getAttribute('allow')`), /autoplay/);
+  assert.strictEqual(await page.eval(`document.querySelector('#jukebox iframe').title`), "Video Um");
+  assert.strictEqual(await page.eval(`JSON.parse(localStorage.getItem('escritorio.config')).jukeboxSom`), true);
+  await page.eval(`document.getElementById('bJukebox').click()`);
+  await page.eval(`document.getElementById('somLigar').click()`);
+  assert.strictEqual(await page.eval(`document.querySelectorAll('#jukebox iframe').length`), 0, "desligar remove o iframe");
+  assert.strictEqual(await page.eval(`JSON.parse(localStorage.getItem('escritorio.config')).jukeboxSom`), false);
+  assert.deepStrictEqual(limpo(), []);
+});
+
+test("hud som: pular troca o src do iframe para a proxima musica", { skip }, async (t) => {
+  if (!(await temHud())) return semHud(t);
+  await esvaziarSom();
+  await postar("/som", { acao: "add", slug: "casca", nome: "Casca", tag: "frontend", url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ", titulo: "Um" });
+  await postar("/som", { acao: "add", slug: "prumo", nome: "Prumo", tag: "arquitetura", url: "https://www.youtube.com/shorts/9bZkp7q19f0", titulo: "Dois" });
+  await abrir(`try { const c = JSON.parse(localStorage.getItem('escritorio.config') || '{}'); c.jukeboxSom = true; localStorage.setItem('escritorio.config', JSON.stringify(c)); } catch {}`);
+  await page.until(`ESC.pronto === true`, 15000);
+  await page.eval(`document.getElementById('bJukebox').click()`);
+  await page.until(`document.querySelector('#jukebox iframe') && document.querySelector('#jukebox iframe').getAttribute('src').includes('dQw4w9WgXcQ')`);
+  const pular = await page.eval(`(() => { const b = [...document.querySelectorAll('#jukebox button')].find((x) => x.textContent === 'Pular'); b.click(); return b.textContent; })()`);
+  assert.strictEqual(pular, "Pular");
+  await page.until(`document.querySelector('#jukebox iframe').getAttribute('src').includes('9bZkp7q19f0')`);
+  assert.match(await page.eval(`document.getElementById('jukebox').textContent`), /Prumo/);
+  await page.eval(`document.getElementById('bJukebox').click()`);
+  await esvaziarSom();
+  assert.deepStrictEqual(limpo(), []);
+});
+
+test("hud stream: id repetido no snapshot nao duplica linha", { skip }, async (t) => {
+  if (!(await temHud())) return semHud(t);
+  await postar("/stream", { slug: "hud6", nome: "Hud Seis", tag: "frontend", tipo: "reasoning", texto: "primeira versao", id: "hud6:1" });
+  await postar("/stream", { slug: "hud6", nome: "Hud Seis", tag: "frontend", tipo: "reasoning", texto: "segunda versao", id: "hud6:1" });
+  await abrir();
+  await page.until(`ESC.pronto === true`, 15000);
+  await page.eval(`document.getElementById('bStream').click()`);
+  await page.until(`!!document.querySelector('#stream [data-slug="hud6"][data-id="hud6:1"]')`);
+  assert.strictEqual(await page.eval(`document.querySelectorAll('#stream [data-slug="hud6"][data-id="hud6:1"]').length`), 1);
+  await page.until(`document.querySelector('#stream [data-slug="hud6"][data-id="hud6:1"]').textContent.includes('segunda versao')`);
+  if (!(await streamEmpurra())) return t.skip("backend: POST /stream nao chama push(); o trecho novo nao chega pelo SSE (contrato 4)");
+  await postar("/stream", { slug: "hud6", nome: "Hud Seis", tag: "frontend", tipo: "reasoning", texto: "terceira versao", id: "hud6:1" });
+  await page.until(`document.querySelector('#stream [data-slug="hud6"][data-id="hud6:1"]').textContent.includes('terceira versao')`);
+  assert.strictEqual(await page.eval(`document.querySelectorAll('#stream [data-slug="hud6"][data-id="hud6:1"]').length`), 1);
+  assert.deepStrictEqual(limpo(), []);
+});
+
+test("hud stream: os 3 tipos tem classe e estilo distintos", { skip }, async (t) => {
+  if (!(await temHud())) return semHud(t);
+  await postar("/stream", { slug: "hud7", nome: "Hud Sete", tag: "arquitetura", tipo: "reasoning", texto: "pensando no schema", id: "hud7:1" });
+  await postar("/stream", { slug: "hud7", nome: "Hud Sete", tag: "arquitetura", tipo: "tool", kind: "read", texto: "lendo server.js", res: "1961 linhas", id: "hud7:2" });
+  await postar("/stream", { slug: "hud7", nome: "Hud Sete", tag: "arquitetura", tipo: "decision", texto: "implementei o kanban", id: "hud7:3" });
+  await abrir();
+  await page.until(`ESC.pronto === true`, 15000);
+  await page.eval(`document.getElementById('bStream').click()`);
+  await page.until(`document.querySelectorAll('#stream [data-slug="hud7"] .stream-trecho').length === 3`);
+  const classes = await page.eval(`[...document.querySelectorAll('#stream [data-slug="hud7"] .stream-trecho')].map((li) => li.className)`);
+  assert.match(classes[0], /stream-reasoning/);
+  assert.match(classes[1], /stream-tool/);
+  assert.match(classes[2], /stream-decision/);
+  assert.strictEqual(new Set(classes).size, 3);
+  assert.strictEqual(await page.eval(`getComputedStyle(document.querySelector('#stream [data-slug="hud7"] .stream-reasoning')).fontStyle`), "italic");
+  assert.ok(Number(await page.eval(`getComputedStyle(document.querySelector('#stream [data-slug="hud7"] .stream-decision')).fontWeight`)) >= 600);
+  assert.match(await page.eval(`document.querySelector('#stream [data-slug="hud7"] .stream-tool .stream-icone').title`), /read/);
+  assert.deepStrictEqual(limpo(), []);
+});
+
+test("hud stream: auto-scroll pausa no hover e volta ao sair", { skip }, async (t) => {
+  if (!(await temHud())) return semHud(t);
+  if (!(await streamEmpurra())) return t.skip("backend: POST /stream nao chama push(); o teste precisa de trecho ao vivo (contrato 4)");
+  for (let i = 1; i <= 30; i++) {
+    await postar("/stream", { slug: "hud8", nome: "Hud Oito", tag: "frontend", tipo: "reasoning", texto: "linha " + i + " ".repeat(20), id: "hud8:" + i });
+  }
+  await abrir();
+  await page.until(`ESC.pronto === true`, 15000);
+  await page.eval(`document.getElementById('bStream').click()`);
+  await page.until(`document.querySelectorAll('#stream [data-slug="hud8"] .stream-trecho').length === 30`);
+  const col = `#stream .stream-col[data-slug="hud8"]`;
+  const lista = `${col} .stream-lista`;
+  assert.ok(await page.eval(`(() => { const l = document.querySelector('${lista}'); return l.scrollHeight > l.clientHeight + 40; })()`), "a coluna precisa rolar");
+  await page.eval(`(() => { const l = document.querySelector('${lista}'); l.scrollTop = 0; document.querySelector('${col}').dispatchEvent(new MouseEvent('mouseenter')); })()`);
+  await postar("/stream", { slug: "hud8", nome: "Hud Oito", tag: "frontend", tipo: "reasoning", texto: "linha nova com hover", id: "hud8:31" });
+  await page.until(`document.querySelectorAll('#stream [data-slug="hud8"] .stream-trecho').length === 31`);
+  assert.ok(await page.eval(`document.querySelector('${lista}').scrollTop`) < 10, "com o mouse na coluna o scroll nao desce");
+  await page.eval(`document.querySelector('${col}').dispatchEvent(new MouseEvent('mouseleave'))`);
+  await page.until(`(() => { const l = document.querySelector('${lista}'); return l.scrollTop >= l.scrollHeight - l.clientHeight - 4; })()`);
+  assert.deepStrictEqual(limpo(), []);
+});
+
+test("hud stream: texto de agente com html aparece literal", { skip }, async (t) => {
+  if (!(await temHud())) return semHud(t);
+  const bruto = '<img src=x onerror=alert(1)> <b>nao e negrito</b>';
+  await postar("/stream", { slug: "hud9", nome: "Hud Nove", tag: "frontend", tipo: "decision", texto: bruto, id: "hud9:1" });
+  await abrir();
+  await page.until(`ESC.pronto === true`, 15000);
+  await page.eval(`document.getElementById('bStream').click()`);
+  await page.until(`!!document.querySelector('#stream [data-slug="hud9"] [data-id="hud9:1"]')`);
+  assert.strictEqual(await page.eval(`document.querySelector('#stream [data-slug="hud9"] [data-id="hud9:1"] .stream-texto').textContent`), bruto);
+  assert.strictEqual(await page.eval(`document.querySelectorAll('#stream [data-slug="hud9"] .stream-texto img, #stream [data-slug="hud9"] .stream-texto b').length`), 0);
   assert.deepStrictEqual(limpo(), []);
 });

@@ -7,6 +7,7 @@ const PADRAO = {
   qualidade: globalThis.matchMedia?.('(pointer: coarse)').matches ? 'baixa' : 'alta', // alta | baixa (celular: baixa)
   camera: 'seguir',       // livre | seguir | cinema
   som: false,
+  jukeboxSom: false,      // "ligar som" da jukebox (config.som e dos avisos de interface)
   fixar: false,           // janela sempre por cima
   compacto: false,
   painelMin: false,       // painel do contexto minimizado

@@ -161,6 +161,244 @@ function gravarChat() { return gravarJson(CHAT_FILE, CHAT.lista.slice(-CHAT_MAX)
 })();
 
 
+// ---------- kanban, som e stream (docs/CONTRATO-HUD-KANBAN-SOM-STREAM.md) ----------
+const KANBAN_FILE = DADOS ? path.join(DADOS, "kanban.json") : "";
+const SOM_FILE = DADOS ? path.join(DADOS, "som.json") : "";
+const COLS = ["fila", "fazendo", "revisao", "feito"];
+const KANBAN_MAX = 200;
+const FEITO_MAX = 20;
+const FILA_MAX = 50;
+const TITULO_MAX = 80;
+const NOME_MAX = 40;
+const TEXTO_MAX = 600;
+const STREAM_MAX = 200; // trechos por slug
+const STREAM_SLUGS = 40; // colunas simultaneas
+const STREAM_JANELA = 5; // trechos no snapshot
+const STREAM_CORTE = 240; // corte de texto/res no snapshot
+const TIPOS_STREAM = ["reasoning", "tool", "decision"];
+
+const KANBAN = { seq: 0, cards: [] };
+const SOM = { seq: 0, atual: null, fila: [] };
+const STREAM = { seq: 0, porSlug: new Map() }; // so memoria, nunca em DADOS
+
+// titulos genericos nao viram card: sao o "sem tarefa" disfarcado
+const tituloReal = (s) => {
+  const t = cut(s, TITULO_MAX);
+  return t === "trabalhando" || t === "teste manual" ? "" : t;
+};
+const horaDe = (t) => new Date(t).toTimeString().slice(0, 8);
+
+// ---------- kanban: estado e persistencia ----------
+function kanbanLista(slug) {
+  const ordem = new Map(COLS.map((c, i) => [c, i]));
+  return KANBAN.cards
+    .filter((c) => !slug || c.slug === slug)
+    .slice()
+    .sort((a, b) => (ordem.get(a.col) - ordem.get(b.col)) || (a.t - b.t) || String(a.id).localeCompare(String(b.id)))
+    .map((c) => ({ ...c }));
+}
+// o teto de 20 em "feito" e FIFO: sai o mais antigo, sem erro
+function kanbanApararFeito() {
+  for (;;) {
+    const feito = KANBAN.cards.filter((c) => c.col === "feito").sort((a, b) => a.t - b.t);
+    if (feito.length <= FEITO_MAX) return;
+    KANBAN.cards = KANBAN.cards.filter((c) => c !== feito[0]);
+  }
+}
+function kanbanNovo(slug, nome, tag, titulo, col, auto) {
+  const t = Date.now();
+  return {
+    id: auto ? "auto-" + slug : "k" + ++KANBAN.seq,
+    slug, nome: cut(nome || slug, NOME_MAX) || slug, tag: TAG_OK.test(String(tag || "")) ? tag : "",
+    titulo, col, auto, t, hora: horaDe(t),
+  };
+}
+let kanbanTimer = null;
+function agendarKanban() {
+  if (!KANBAN_FILE || kanbanTimer) return;
+  kanbanTimer = setTimeout(() => { kanbanTimer = null; gravarKanban(); }, 400);
+}
+function gravarKanban() { return gravarJson(KANBAN_FILE, { versao: 1, cards: KANBAN.cards }); }
+
+function cardValido(c) {
+  return !!c && typeof c === "object" &&
+    typeof c.id === "string" && c.id.length > 0 && c.id.length <= 64 &&
+    typeof c.slug === "string" && SLUG_OK.test(c.slug) &&
+    typeof c.nome === "string" && c.nome.length > 0 && c.nome.length <= NOME_MAX &&
+    typeof c.tag === "string" && (c.tag === "" || TAG_OK.test(c.tag)) &&
+    typeof c.titulo === "string" && c.titulo.length > 0 && c.titulo.length <= TITULO_MAX + 1 &&
+    COLS.includes(c.col) && typeof c.auto === "boolean" &&
+    Number.isInteger(c.t) && typeof c.hora === "string";
+}
+// boot: arquivo corrompido vai para .corrompido (nada de apagar dado de ninguem)
+(function carregarKanban() {
+  if (!KANBAN_FILE) return;
+  if (!fs.existsSync(KANBAN_FILE)) return;
+  let bruto;
+  try { bruto = fs.readFileSync(KANBAN_FILE, "utf8"); } catch { return; }
+  let dados = null;
+  try { dados = JSON.parse(bruto); } catch {}
+  if (!dados || !Array.isArray(dados.cards)) {
+    try { fs.renameSync(KANBAN_FILE, KANBAN_FILE + ".corrompido"); } catch {}
+    note("kanban: arquivo corrompido, guardado em .corrompido");
+    return;
+  }
+  KANBAN.cards = dados.cards.filter(cardValido).map((c) => ({
+    id: c.id, slug: c.slug, nome: c.nome, tag: c.tag, titulo: c.titulo,
+    col: c.col, auto: c.auto, t: c.t, hora: c.hora,
+  }));
+  for (const c of KANBAN.cards) {
+    const m = /^k(\d+)$/.exec(c.id);
+    if (m) KANBAN.seq = Math.max(KANBAN.seq, Number(m[1]));
+  }
+})();
+
+// ponto unico das transicoes automaticas: setA() (mesa) e /sub (moradores)
+function kanbanEstado(slug, nome, tag, status, titulo, origem) {
+  if (!SLUG_OK.test(String(slug || ""))) return null;
+  if (!["working", "waiting", "done"].includes(status)) return null;
+  const i = KANBAN.cards.findIndex((c) => c.id === "auto-" + slug);
+  const real = tituloReal(titulo);
+  const nomeOk = cut(nome || slug, NOME_MAX) || slug;
+  const tagOk = TAG_OK.test(String(tag || "")) ? tag : "";
+
+  if (i < 0) {
+    if (!real || status === "done") return null; // sem tarefa real nao nasce card
+    if (KANBAN.cards.length >= KANBAN_MAX) return null; // o quadro cheio nao pode derrubar o fluxo real
+    const card = kanbanNovo(slug, nomeOk, tagOk, real, status === "waiting" ? "revisao" : "fazendo", true);
+    KANBAN.cards.push(card);
+    agendarKanban(); push();
+    return card;
+  }
+
+  const c = KANBAN.cards[i];
+  if (status === "done") {
+    if (c.col === "feito") {
+      // sair de quem ja esta em "feito" arquiva; fim de turno da mesa deixa ficar
+      if (origem === "sub") {
+        KANBAN.cards.splice(i, 1);
+        agendarKanban(); push();
+        return null;
+      }
+    } else {
+      c.col = "feito";
+      kanbanApararFeito();
+    }
+  } else {
+    c.col = status === "waiting" ? "revisao" : "fazendo";
+  }
+  if (real) c.titulo = real;
+  c.nome = nomeOk;
+  c.tag = tagOk;
+  agendarKanban(); push();
+  return c;
+}
+
+// ---------- som: estado e persistencia ----------
+const YT = /^https?:\/\/(?:www\.|m\.|music\.)?youtube\.com\/(?:watch\?(?:[^#]*&)?v=|shorts\/|embed\/|live\/)([A-Za-z0-9_-]{11})(?:[?&#].*)?$/i;
+const YT_BE = /^https?:\/\/youtu\.be\/([A-Za-z0-9_-]{11})(?:[?&#].*)?$/i;
+const ytVid = (url) => {
+  const u = String(url || "").trim();
+  if (!u || u.length > 2048) return "";
+  const m = YT.exec(u) || YT_BE.exec(u);
+  return m ? m[1] : "";
+};
+const somEstado = () => ({ atual: SOM.atual ? { ...SOM.atual } : null, fila: SOM.fila.map((x) => ({ ...x })) });
+let somTimer = null;
+function agendarSom() {
+  if (!SOM_FILE || somTimer) return;
+  somTimer = setTimeout(() => { somTimer = null; gravarSom(); }, 400);
+}
+function gravarSom() { return gravarJson(SOM_FILE, { versao: 1, atual: SOM.atual, fila: SOM.fila }); }
+
+function itemSomValido(x) {
+  return !!x && typeof x === "object" &&
+    typeof x.id === "string" && /^s\d+$/.test(x.id) &&
+    typeof x.slug === "string" && SLUG_OK.test(x.slug) &&
+    typeof x.nome === "string" && x.nome.length <= NOME_MAX &&
+    typeof x.tag === "string" && (x.tag === "" || TAG_OK.test(x.tag)) &&
+    typeof x.vid === "string" && /^[A-Za-z0-9_-]{11}$/.test(x.vid) &&
+    typeof x.titulo === "string" && x.titulo.length <= TITULO_MAX + 1 &&
+    typeof x.url === "string" && typeof x.t === "number" && typeof x.hora === "string";
+}
+// boot: som.json corrompido tambem vira .corrompido; o que passa na validacao volta
+(function carregarSom() {
+  if (!SOM_FILE) return;
+  if (!fs.existsSync(SOM_FILE)) return;
+  let bruto;
+  try { bruto = fs.readFileSync(SOM_FILE, "utf8"); } catch { return; }
+  let dados = null;
+  try { dados = JSON.parse(bruto); } catch {}
+  if (!dados || typeof dados !== "object" || (!Array.isArray(dados.fila) && dados.atual !== null)) {
+    try { fs.renameSync(SOM_FILE, SOM_FILE + ".corrompido"); } catch {}
+    note("som: arquivo corrompido, guardado em .corrompido");
+    return;
+  }
+  if (itemSomValido(dados.atual)) SOM.atual = { ...dados.atual };
+  if (Array.isArray(dados.fila)) SOM.fila = dados.fila.filter(itemSomValido).slice(0, FILA_MAX).map((x) => ({ ...x }));
+  for (const it of [SOM.atual, ...SOM.fila]) {
+    if (!it) continue;
+    SOM.seq = Math.max(SOM.seq, Number(it.id.slice(1)) || 0);
+  }
+})();
+
+// ---------- stream: so memoria (ring por slug, dedupe pelo ultimo id) ----------
+function streamAdd(d) {
+  const slug = String((d && d.slug) || "");
+  if (!SLUG_OK.test(slug)) return null;
+  const tipo = String((d && d.tipo) || "");
+  if (!TIPOS_STREAM.includes(tipo)) return null;
+  const texto = cut(d.texto, TEXTO_MAX);
+  if (!texto) return null;
+  const kind = tipo === "decision" ? "think" : (KINDS.has(d.kind) ? d.kind : "think");
+  const res = tipo === "tool" ? cut(d.res || "", TEXTO_MAX) : "";
+  const t = Date.now();
+  const id = d.id || slug + ":" + ++STREAM.seq;
+
+  let lista = STREAM.porSlug.get(slug);
+  if (!lista) {
+    if (STREAM.porSlug.size >= STREAM_SLUGS) {
+      // descarta a coluna com trecho mais antigo
+      let velho = null, velhoT = Infinity;
+      for (const [k, v] of STREAM.porSlug) {
+        const ultimoT = v.length ? v[v.length - 1].t : 0;
+        if (ultimoT < velhoT) { velhoT = ultimoT; velho = k; }
+      }
+      if (velho !== null) STREAM.porSlug.delete(velho);
+    }
+    lista = [];
+    STREAM.porSlug.set(slug, lista);
+  }
+
+  const nome = cut((d.nome || slug), NOME_MAX) || slug;
+  const tag = TAG_OK.test(String(d.tag || "")) ? d.tag : "";
+  const ultimo = lista[lista.length - 1];
+  if (ultimo && ultimo.id === id && ultimo.tipo === tipo) {
+    Object.assign(ultimo, { t, hora: horaDe(t), nome, tag, kind, texto, res });
+  } else {
+    lista.push({ id, t, hora: horaDe(t), slug, nome, tag, tipo, kind, texto, res });
+    while (lista.length > STREAM_MAX) lista.shift();
+  }
+  return id;
+}
+// janela curta do snapshot: o historico completo fica em GET /stream
+function streamJanela() {
+  const out = {};
+  for (const [slug, lista] of STREAM.porSlug) {
+    out[slug] = lista.slice(-STREAM_JANELA).map((x) => ({ ...x, texto: cut(x.texto, STREAM_CORTE), res: cut(x.res, STREAM_CORTE) }));
+  }
+  return out;
+}
+const limparStream = () => { STREAM.seq = 0; STREAM.porSlug.clear(); };
+
+// respostas JSON novas (o /chat continua com o formato dele)
+function jsonOut(res, status, valor) {
+  const body = JSON.stringify(valor);
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Content-Length": Buffer.byteLength(body) });
+  res.end(body);
+}
+const erroJson = (res, status, codigo, mensagem) => jsonOut(res, status, { erro: { codigo, mensagem } });
+
 // ---------- subagentes ----------
 function touchChild(sid) {
   childActive.set(sid, Date.now());
@@ -211,6 +449,9 @@ function snapshot() {
   S.cost = [...p.costs.values()].reduce((a, b) => a + b, p.costBase);
   S.tags = { ...TAGS };
   S.chat = CHAT.lista.slice(-50);
+  S.kanban = { cards: kanbanLista() };
+  S.som = somEstado();
+  S.stream = streamJanela();
   S.now = now;
   return S;
 }
@@ -254,6 +495,8 @@ function setA(who, status, text, kind) {
   if (status === "done") a.until = Date.now() + 8000;
   if (status === "error") a.until = Date.now() + 20000;
   if (status === "idle") a.since = 0;
+  // o card automatico segue o estado real da mesa (plan/build)
+  kanbanEstado(who, NOMES[who] || who, TAGS[who] || "", status, text, "mesa");
   push();
   return true;
 }
@@ -380,6 +623,26 @@ function handle(ev) {
         const ci = childInfo.get(part.sessionID) || { name: "subagente", task: "" };
         childInfo.set(part.sessionID, { ...ci, text, kind });
         text = "› " + text;
+      }
+      // stream de pensamento: guarda o texto real da parte, nao o rotulo do balao
+      {
+        const slug = child ? part.sessionID : main;
+        const ci = child ? (childInfo.get(part.sessionID) || {}) : {};
+        const nome = child ? (ci.name || "subagente") : NOMES[main];
+        const tag = TAGS[slug] || "";
+        if (part.type === "reasoning") {
+          streamAdd({ slug, nome, tag, tipo: "reasoning", kind: "think", texto: part.text || "", id: part.id });
+        } else if (part.type === "tool") {
+          const st = part.state || {};
+          let res = "";
+          if (st.status === "error") {
+            const em = (st.error && (st.error.message || st.error)) || "";
+            res = "falhou: " + (typeof em === "string" ? em : JSON.stringify(em));
+          } else if (st.output !== undefined && st.output !== null) {
+            res = typeof st.output === "string" ? st.output : JSON.stringify(st.output);
+          }
+          streamAdd({ slug, nome, tag, tipo: "tool", kind, texto: text, res, id: part.id || part.callID });
+        }
       }
       work(text, kind);
       break;
@@ -670,6 +933,12 @@ function handleClaude(p) {
       const skill = p.tool_name === "Skill" && text.slice("usando a skill ".length);
       if (p.tool_name === "ExitPlanMode") main = "plan";
       const child = ccChild(p); // antes de criar um subagente novo: ele nao pode ser confundido com o pai
+      {
+        const slug = child || main;
+        const ci = child ? (childInfo.get(child) || {}) : {};
+        streamAdd({ slug, nome: child ? (ci.name || "subagente") : NOMES[main], tag: TAGS[slug] || "",
+          tipo: "tool", kind, texto: text, res: "", id: p.tool_use_id ? "cc:" + p.tool_use_id : undefined });
+      }
       if (p.tool_name === "Task" || p.tool_name === "Agent") {
         const id = "cc:" + (p.tool_use_id || Date.now());
         const i = p.tool_input || {};
@@ -699,6 +968,18 @@ function handleClaude(p) {
     case "PostToolUse":
     case "PostToolUseFailure": {
       const i = p.tool_input || {};
+      {
+        // mesmo id do PreToolUse: o resumo cresce dentro do mesmo trecho
+        const child = ccChild(p);
+        const slug = child || main;
+        const ci = child ? (childInfo.get(child) || {}) : {};
+        const [txt, kd] = ccDescribe(p.tool_name, p.tool_input);
+        const bruto = typeof p.tool_response === "string" ? p.tool_response : JSON.stringify(p.tool_response ?? "");
+        const falhou = ev === "PostToolUseFailure";
+        streamAdd({ slug, nome: child ? (ci.name || "subagente") : NOMES[main], tag: TAGS[slug] || "",
+          tipo: "tool", kind: kd, texto: txt, res: (falhou ? "falhou: " : "") + bruto,
+          id: p.tool_use_id ? "cc:" + p.tool_use_id : undefined });
+      }
       if (["Edit", "MultiEdit", "Write", "NotebookEdit"].includes(p.tool_name) && (i.file_path || i.notebook_path)) addEdited(i.file_path || i.notebook_path);
       if (p.tool_name === "Task" || p.tool_name === "Agent") {
         const id = "cc:" + p.tool_use_id;
@@ -904,7 +1185,9 @@ function serveStatic(pathname, res) {
 
 // celular: o link com ?t=<token> grava um cookie; depois so o cookie vale.
 // Pelo celular so a pagina, o estado e as respostas (nada de /set, /claude, /janela...)
-const REMOTE_PATHS = new Set(["/", "/index.html", "/events", "/responder", "/fora", "/chat", "/favicon.ico"]);
+const REMOTE_PATHS = new Set(["/", "/index.html", "/events", "/responder", "/fora", "/chat", "/favicon.ico", "/kanban", "/som", "/stream"]);
+// do celular estas tres sao somente leitura: o POST continua valendo so no localhost
+const REMOTE_LEITURA = new Set(["/kanban", "/som", "/stream"]);
 function remoteAuth(req, res, url) {
   const t = url.searchParams.get("t");
   if (t !== null && remoto.tokenOk(REMOTO, t)) {
@@ -917,10 +1200,163 @@ function remoteAuth(req, res, url) {
     res.end("Abra o link com o token (rode node remoto.js no computador para ver o link).");
     return false;
   }
-  if (REMOTE_PATHS.has(url.pathname) || /^\/(js|css|vendor)\//.test(url.pathname)) return true;
+  if (REMOTE_PATHS.has(url.pathname) || /^\/(js|css|vendor)\//.test(url.pathname)) {
+    if (REMOTE_LEITURA.has(url.pathname) && req.method !== "GET") {
+      res.writeHead(403);
+      res.end();
+      return false;
+    }
+    return true;
+  }
   res.writeHead(403);
   res.end();
   return false;
+}
+
+// ---------- rotas novas do HUD: kanban, som e stream ----------
+// o callback do readBody roda fora do try do route(): um erro aqui nao pode derrubar o processo
+const comCorpo = (res, fn) => (body) => {
+  try { fn(body); } catch (e) { try { if (!res.headersSent) erroJson(res, 500, "ERRO_INTERNO", "erro interno"); } catch {} }
+};
+
+function rotaKanban(req, res, body) {
+  let j;
+  try { j = JSON.parse(body || "{}"); } catch { return erroJson(res, 400, "CORPO_INVALIDO", "corpo deve ser JSON"); }
+  if (!j || typeof j !== "object" || Array.isArray(j) || typeof j.acao !== "string" || !j.acao) {
+    return erroJson(res, 400, "CORPO_INVALIDO", "acao obrigatoria");
+  }
+  if (!["add", "mover", "fechar", "limpar"].includes(j.acao)) {
+    return erroJson(res, 400, "ACAO_INVALIDA", "acao deve ser add, mover, fechar ou limpar");
+  }
+
+  if (j.acao === "add") {
+    if (typeof j.slug !== "string" || !SLUG_OK.test(j.slug)) return erroJson(res, 400, "SLUG_INVALIDO", "slug invalido");
+    const titulo = typeof j.titulo === "string" ? tituloReal(j.titulo) : "";
+    if (!titulo) return erroJson(res, 400, "TITULO_INVALIDO", "titulo obrigatorio (1 a 80 caracteres)");
+    if (j.col !== undefined && (typeof j.col !== "string" || !COLS.includes(j.col))) {
+      return erroJson(res, 400, "COLUNA_INVALIDA", "coluna deve ser fila, fazendo, revisao ou feito");
+    }
+    if (j.tag !== undefined && (typeof j.tag !== "string" || !TAG_OK.test(j.tag))) {
+      return erroJson(res, 400, "TAG_INVALIDA", "tag invalida");
+    }
+    if (KANBAN.cards.length >= KANBAN_MAX) return erroJson(res, 409, "LIMITE_CARDS", "o quadro ja tem 200 cards");
+    const card = kanbanNovo(j.slug, j.nome || j.slug, j.tag !== undefined ? j.tag : (TAGS[j.slug] || ""), titulo, j.col || "fila", false);
+    KANBAN.cards.push(card);
+    kanbanApararFeito();
+    agendarKanban(); push();
+    return jsonOut(res, 201, { card: { ...card }, cards: kanbanLista() });
+  }
+
+  if (j.acao === "limpar") {
+    KANBAN.cards = KANBAN.cards.filter((c) => c.col !== "feito");
+    agendarKanban(); push();
+    return jsonOut(res, 200, { card: null, cards: kanbanLista() });
+  }
+
+  // mover e fechar: id antes da existencia
+  if (typeof j.id !== "string" || !j.id) return erroJson(res, 400, "ID_INVALIDO", "id obrigatorio");
+  if (j.acao === "mover" && (typeof j.col !== "string" || !COLS.includes(j.col))) {
+    return erroJson(res, 400, "COLUNA_INVALIDA", "coluna deve ser fila, fazendo, revisao ou feito");
+  }
+  const i = KANBAN.cards.findIndex((c) => c.id === j.id);
+  if (i < 0) return erroJson(res, 404, "CARD_NAO_ENCONTRADO", "card " + cut(j.id, 32) + " nao existe");
+
+  const card = KANBAN.cards[i];
+  if (j.acao === "fechar") {
+    KANBAN.cards.splice(i, 1);
+    agendarKanban(); push();
+    return jsonOut(res, 200, { card: { ...card }, cards: kanbanLista() });
+  }
+  card.col = j.col;
+  kanbanApararFeito();
+  agendarKanban(); push();
+  return jsonOut(res, 200, { card: { ...card }, cards: kanbanLista() });
+}
+
+function itemSom(j, tag) {
+  const t = Date.now();
+  return {
+    id: "s" + ++SOM.seq, slug: j.slug, nome: cut(j.nome || j.slug, NOME_MAX) || j.slug,
+    tag: tag !== undefined ? tag : (TAGS[j.slug] || ""), vid: ytVid(j.url),
+    titulo: cut(j.titulo || "", TITULO_MAX), url: "", t, hora: horaDe(t),
+  };
+}
+
+function rotaSom(req, res, body) {
+  let j;
+  try { j = JSON.parse(body || "{}"); } catch { return erroJson(res, 400, "CORPO_INVALIDO", "corpo deve ser JSON"); }
+  if (!j || typeof j !== "object" || Array.isArray(j) || typeof j.acao !== "string" || !j.acao) {
+    return erroJson(res, 400, "CORPO_INVALIDO", "acao obrigatoria");
+  }
+  if (!["add", "pular", "limpar"].includes(j.acao)) {
+    return erroJson(res, 400, "ACAO_INVALIDA", "acao deve ser add, pular ou limpar");
+  }
+
+  if (j.acao === "pular") {
+    SOM.atual = SOM.fila.length ? SOM.fila.shift() : null;
+    agendarSom(); push();
+    return jsonOut(res, 200, somEstado());
+  }
+  if (j.acao === "limpar") {
+    SOM.fila = []; // o atual continua tocando; para parar, pular
+    agendarSom(); push();
+    return jsonOut(res, 200, somEstado());
+  }
+
+  // add: slug -> url -> tag -> limite
+  if (typeof j.slug !== "string" || !SLUG_OK.test(j.slug)) return erroJson(res, 400, "SLUG_INVALIDO", "slug invalido");
+  const vid = ytVid(j.url);
+  if (!vid) return erroJson(res, 400, "URL_INVALIDA", "use um link do YouTube (watch, shorts, embed, live ou youtu.be)");
+  if (j.tag !== undefined && (typeof j.tag !== "string" || !TAG_OK.test(j.tag))) {
+    return erroJson(res, 400, "TAG_INVALIDA", "tag invalida");
+  }
+  if (SOM.fila.length >= FILA_MAX) return erroJson(res, 409, "LIMITE_FILA", "a fila ja tem 50 itens");
+
+  const item = itemSom(j, j.tag);
+  item.url = "https://www.youtube.com/watch?v=" + vid;
+  if (SOM.atual === null) SOM.atual = item;
+  else SOM.fila.push(item);
+  agendarSom(); push();
+  return jsonOut(res, 200, somEstado());
+}
+
+const ID_STREAM = /^[A-Za-z0-9:._-]{1,64}$/;
+
+function rotaStream(req, res, body) {
+  let j;
+  try { j = JSON.parse(body || "{}"); } catch { return erroJson(res, 400, "CORPO_INVALIDO", "corpo deve ser JSON"); }
+  if (!j || typeof j !== "object" || Array.isArray(j)) return erroJson(res, 400, "CORPO_INVALIDO", "corpo deve ser um objeto JSON");
+  if (typeof j.slug !== "string" || typeof j.tipo !== "string" || typeof j.texto !== "string") {
+    return erroJson(res, 400, "CORPO_INVALIDO", "slug, tipo e texto sao obrigatorios");
+  }
+  if (!SLUG_OK.test(j.slug)) return erroJson(res, 400, "SLUG_INVALIDO", "slug invalido");
+  if (!TIPOS_STREAM.includes(j.tipo)) return erroJson(res, 400, "TIPO_INVALIDO", "tipo deve ser reasoning, tool ou decision");
+
+  // texto vazio e streaming normal: responde 200 e nao cria trecho
+  if (!j.texto.trim()) return jsonOut(res, 200, { ok: true, ignorado: true });
+
+  let kind;
+  if (j.tipo === "tool") {
+    if (!KINDS.has(j.kind)) return erroJson(res, 400, "KIND_INVALIDO", "tool precisa de kind valido");
+    kind = j.kind;
+  } else if (j.tipo === "decision") {
+    if (j.kind !== undefined && j.kind !== "think") return erroJson(res, 400, "KIND_INVALIDO", "decision usa kind think");
+    kind = "think";
+  } else {
+    if (j.kind !== undefined && !KINDS.has(j.kind)) return erroJson(res, 400, "KIND_INVALIDO", "kind invalido");
+    kind = j.kind || "think";
+  }
+
+  if (j.id !== undefined && (typeof j.id !== "string" || !ID_STREAM.test(j.id))) {
+    return erroJson(res, 400, "ID_INVALIDO", "id fora do formato");
+  }
+
+  const id = streamAdd({
+    slug: j.slug, nome: j.nome, tag: j.tag, tipo: j.tipo, kind,
+    texto: j.texto, res: j.res, id: j.id,
+  });
+  if (!id) return erroJson(res, 400, "CORPO_INVALIDO", "texto vazio");
+  return jsonOut(res, 200, { ok: true, id });
 }
 
 function route(req, res) {
@@ -958,6 +1394,8 @@ function route(req, res) {
     if (tag && TAG_OK.test(tag) && SLUG_OK.test(id)) TAGS[id] = tag;
     if ((q.get("status") || "working") === "done") {
       endChild(id, true);
+      const ci = childInfo.get(id) || {};
+      kanbanEstado(id, ci.name || q.get("name") || id, TAGS[id] || "", "done", "", "sub");
     } else {
       const old = childInfo.get(id) || {};
       const info = {
@@ -970,11 +1408,53 @@ function route(req, res) {
       touchChild(id);
       // o balao do morador tambem entra no chat; texto vazio nao fala nada
       if (q.get("text")) fala(id, info.name, info.kind, info.text);
+      // entrar (com task) atualiza o titulo; passo (sem task) nao troca o titulo do card
+      const existe = KANBAN.cards.some((c) => c.id === "auto-" + id);
+      const situacao = (q.get("status") || "working") === "waiting" ? "waiting" : "working";
+      kanbanEstado(id, info.name, TAGS[id] || "", situacao, q.get("task") || (existe ? "" : q.get("text") || ""), "sub");
     }
     note("sub " + (q.get("status") || "working") + " " + id + " " + (q.get("text") || "").slice(0, 200));
     push();
     res.writeHead(200);
     return res.end("ok");
+  }
+
+  // kanban: GET ?slug= | POST { acao: add|mover|fechar|limpar }
+  if (url.pathname === "/kanban") {
+    if (req.method === "GET") {
+      const slug = url.searchParams.get("slug");
+      if (slug !== null && !SLUG_OK.test(slug)) return erroJson(res, 400, "SLUG_INVALIDO", "slug invalido");
+      return jsonOut(res, 200, { cards: kanbanLista(slug) });
+    }
+    if (req.method === "POST") return readBody(req, res, comCorpo(res, (body) => rotaKanban(req, res, body)));
+    res.writeHead(405);
+    return res.end();
+  }
+
+  // som: GET | POST { acao: add|pular|limpar }
+  if (url.pathname === "/som") {
+    if (req.method === "GET") return jsonOut(res, 200, somEstado());
+    if (req.method === "POST") return readBody(req, res, comCorpo(res, (body) => rotaSom(req, res, body)));
+    res.writeHead(405);
+    return res.end();
+  }
+
+  // stream: GET ?slug= | POST de um trecho
+  if (url.pathname === "/stream") {
+    if (req.method === "GET") {
+      const slug = url.searchParams.get("slug");
+      if (slug !== null && !SLUG_OK.test(slug)) return erroJson(res, 400, "SLUG_INVALIDO", "slug invalido");
+      const streams = {};
+      for (const [k, lista] of STREAM.porSlug) {
+        if (slug !== null && k !== slug) continue;
+        streams[k] = lista.map((x) => ({ ...x }));
+      }
+      if (slug !== null && !streams[slug]) streams[slug] = [];
+      return jsonOut(res, 200, { streams });
+    }
+    if (req.method === "POST") return readBody(req, res, comCorpo(res, (body) => rotaStream(req, res, body)));
+    res.writeHead(405);
+    return res.end();
   }
 
   // tag de funcao: /tag?id=leme&tag=backend (o tsv continua sendo a fonte dos moradores)
@@ -1096,4 +1576,7 @@ if (require.main === module) start();
 module.exports = { _setOpener: (fn) => { opener = fn; }, _setRemoto: (c) => { REMOTO = c; S.remoto = !!c; }, ligarRemoto,
   remoteServer: () => remoteServer, responder, setFora, S, server, handle, handleClaude, snapshot, setA, sseEvents,
   fala, tags: () => ({ ...TAGS }), chat: () => CHAT.lista.slice(), _gravarChat: gravarChat, _dados: () => DADOS,
+  kanbanEstado, kanban: () => kanbanLista(), streamAdd, _limparStream: limparStream,
+  _gravarKanban: gravarKanban, _gravarSom: gravarSom, _kanban: () => KANBAN, _som: () => SOM,
+  _limparKanban: () => { KANBAN.cards = []; KANBAN.seq = 0; }, _limparSom: () => { SOM.seq = 0; SOM.atual = null; SOM.fila = []; },
   sizes: () => ({ sessions: sessions.size, loggedParts: loggedParts.size, ccSubs: ccSubs.size, projects: projects.size }) };
