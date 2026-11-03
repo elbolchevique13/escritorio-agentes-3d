@@ -12,6 +12,7 @@ const crypto = require("crypto");
 const remoto = require("./remoto");
 
 const PORT = process.env.PORT || 4747;
+const HOST = process.env.HOST || "127.0.0.1";
 const OC_PORT = process.env.OC_PORT || 4096;
 const LOG = process.env.ESCRITORIO_LOG_FILE || path.join(__dirname, "events.log");
 const DEBUG_LOG = process.env.ESCRITORIO_LOG === "1";
@@ -50,6 +51,20 @@ const childDone = new Map(); // sessionID de subagente -> quando terminou (fica 
 const loggedParts = new Set();
 const sampled = new Set();
 
+// ---------- tags de funcao ----------
+// coluna "tag" do agentes.tsv: 1-2 palavras minusculas, ate 16 caracteres
+const TAG_OK = /^[a-z0-9][a-z0-9-]{0,15}$/;
+const SLUG_OK = /^[a-z0-9][a-z0-9-]{0,31}$/;
+// plan e build nao moram no agentes.tsv: a tag deles nasce aqui
+const TAGS = { plan: "auditor", build: "construtor" };
+// onde o volume guarda chat.json e tags.json (no container: /app/dados)
+const DADOS = process.env.ESCRITORIO_DADOS || (DEBUG_LOG ? path.dirname(LOG) : "");
+const CHAT_FILE = DADOS ? path.join(DADOS, "chat.json") : "";
+const TAGS_FILE = DADOS ? path.join(DADOS, "tags.json") : "";
+const CHAT_MAX = 200;
+const KINDS = new Set(["think", "read", "edit", "bash", "search", "web", "wait", "skill"]);
+const CHAT = { seq: 0, lista: [] };
+
 // ---------- utilitarios ----------
 const cut = (s, n) => { s = String(s == null ? "" : s).replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
 const base = (p) => String(p || "").split(/[\\/]/).filter(Boolean).pop() || "";
@@ -80,6 +95,72 @@ function addEdited(file) { const p = proj(); p.edited.add(file); cap(p.edited, 2
 // log de depuracao (grava prompts e comandos): so com ESCRITORIO_LOG=1
 const note = (line) => { if (DEBUG_LOG) try { fs.appendFileSync(LOG, line + "\n"); } catch {} };
 
+// ---------- arquivos do volume (chat e tags) ----------
+// grava em arquivo temporario e renomeia: ninguem le um JSON pela metade
+function gravarJson(file, valor) {
+  if (!file) return false;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = file + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(valor));
+    fs.renameSync(tmp, file);
+    return true;
+  } catch { return false; }
+}
+function lerJson(file, padrao) {
+  if (!file) return padrao;
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return padrao; }
+}
+// tags de plan/build sobrevivem ao restart; as dos moradores vem do agentes.tsv
+function salvarTags() { gravarJson(TAGS_FILE, { plan: TAGS.plan, build: TAGS.build }); }
+
+// ---------- chat: os baloes viram historico ----------
+// guarda os ultimos 200 baloes, com hora, quem falou, o kind e o texto
+function fala(slug, nome, kind, texto) {
+  texto = cut(texto, 60);
+  if (!slug || !texto) return null;
+  // se a ultima fala desse morador e o mesmo texto, o balao so continua: nao entra de novo
+  for (let i = CHAT.lista.length - 1; i >= 0; i--) {
+    const x = CHAT.lista[i];
+    if (x.slug !== slug) continue;
+    if (x.texto === texto) return null;
+    break;
+  }
+  const t = Date.now();
+  const item = {
+    id: ++CHAT.seq, t, hora: new Date(t).toTimeString().slice(0, 8),
+    slug: cut(slug, 32), nome: cut(nome || slug, 40),
+    tag: TAGS[slug] || "", kind: KINDS.has(kind) ? kind : "think", texto,
+  };
+  CHAT.lista.push(item);
+  while (CHAT.lista.length > CHAT_MAX) CHAT.lista.shift();
+  agendarChat();
+  return item;
+}
+let chatTimer = null;
+function agendarChat() {
+  if (!CHAT_FILE || chatTimer) return;
+  chatTimer = setTimeout(() => { chatTimer = null; gravarChat(); }, 400);
+}
+function gravarChat() { return gravarJson(CHAT_FILE, CHAT.lista.slice(-CHAT_MAX)); }
+
+// o volume manda: chat e tags de plan/build voltam no restart
+(function carregar() {
+  const lista = lerJson(CHAT_FILE, []);
+  if (Array.isArray(lista)) {
+    for (const x of lista.slice(-CHAT_MAX)) {
+      if (!x || !x.texto) continue;
+      CHAT.lista.push(x);
+      CHAT.seq = Math.max(CHAT.seq, Number(x.id) || 0);
+    }
+  }
+  const tags = lerJson(TAGS_FILE, null);
+  if (tags && typeof tags === "object") {
+    for (const id of ["plan", "build"]) if (TAG_OK.test(tags[id])) TAGS[id] = tags[id];
+  }
+})();
+
+
 // ---------- subagentes ----------
 function touchChild(sid) {
   childActive.set(sid, Date.now());
@@ -92,7 +173,9 @@ function endChild(sid, force) {
 }
 function subView(id, status) {
   const i = childInfo.get(id) || {};
-  return { id, name: i.name || "subagente", task: i.task || "", text: i.text || "", kind: i.kind || "think", status, parent: main };
+  // a tag so aparece se existir e couber no formato; undefined viraria "undefined" no regex
+  const t = TAGS[id];
+  return { id, name: i.name || "subagente", task: i.task || "", text: i.text || "", kind: i.kind || "think", tag: typeof t === "string" && TAG_OK.test(t) ? t : "", status, parent: main };
 }
 // subagente do Claude Code avisa quando termina (PostToolUse/SubagentStop): espera bem mais antes de dar como perdido
 const childTimeout = (id) => (id.startsWith("cc:") ? 10 * 60000 : 25000);
@@ -126,6 +209,8 @@ function snapshot() {
   const p = proj();
   S.files = p.edited.size;
   S.cost = [...p.costs.values()].reduce((a, b) => a + b, p.costBase);
+  S.tags = { ...TAGS };
+  S.chat = CHAT.lista.slice(-50);
   S.now = now;
   return S;
 }
@@ -163,6 +248,8 @@ function setA(who, status, text, kind) {
   a.status = status;
   if (text !== undefined) a.text = text;
   if (kind !== undefined) a.kind = kind;
+  // o mesmo texto que vira balao entra no chat (vazio e silencio nao entram)
+  if (text && status !== "idle") fala(who, NOMES[who] || who, kind, text);
   if (status === "working" || status === "waiting") lastSignal = Date.now();
   if (status === "done") a.until = Date.now() + 8000;
   if (status === "error") a.until = Date.now() + 20000;
@@ -817,7 +904,7 @@ function serveStatic(pathname, res) {
 
 // celular: o link com ?t=<token> grava um cookie; depois so o cookie vale.
 // Pelo celular so a pagina, o estado e as respostas (nada de /set, /claude, /janela...)
-const REMOTE_PATHS = new Set(["/", "/index.html", "/events", "/responder", "/fora", "/favicon.ico"]);
+const REMOTE_PATHS = new Set(["/", "/index.html", "/events", "/responder", "/fora", "/chat", "/favicon.ico"]);
 function remoteAuth(req, res, url) {
   const t = url.searchParams.get("t");
   if (t !== null && remoto.tokenOk(REMOTO, t)) {
@@ -863,25 +950,58 @@ function route(req, res) {
     return res.end(ok ? "ok" : "use agent=plan|build e status=idle|working|waiting|error|done");
   }
 
-  // teste manual de subagente: /sub?id=a1&name=explore&task=buscar&text=procurando&kind=search&status=working|done
+  // teste manual de subagente: /sub?id=a1&name=explore&task=buscar&text=procurando&kind=search&tag=backend&status=working|done
   if (url.pathname === "/sub") {
     const q = url.searchParams;
     const id = q.get("id") || "teste";
+    const tag = String(q.get("tag") || "");
+    if (tag && TAG_OK.test(tag) && SLUG_OK.test(id)) TAGS[id] = tag;
     if ((q.get("status") || "working") === "done") {
       endChild(id, true);
     } else {
       const old = childInfo.get(id) || {};
-      childInfo.set(id, {
+      const info = {
         name: q.get("name") || old.name || "explore",
         task: q.get("task") || old.task || "",
         text: q.get("text") || old.text || "",
         kind: q.get("kind") || old.kind || "think",
-      });
+      };
+      childInfo.set(id, info);
       touchChild(id);
+      // o balao do morador tambem entra no chat; texto vazio nao fala nada
+      if (q.get("text")) fala(id, info.name, info.kind, info.text);
     }
+    note("sub " + (q.get("status") || "working") + " " + id + " " + (q.get("text") || "").slice(0, 200));
     push();
     res.writeHead(200);
     return res.end("ok");
+  }
+
+  // tag de funcao: /tag?id=leme&tag=backend (o tsv continua sendo a fonte dos moradores)
+  if (url.pathname === "/tag") {
+    const q = url.searchParams;
+    const id = String(q.get("id") || "");
+    const tag = String(q.get("tag") || "");
+    const ok = (SLUG_OK.test(id) || id === "plan" || id === "build") && TAG_OK.test(tag);
+    if (!ok) {
+      res.writeHead(400);
+      return res.end("use id de morador (ou plan|build) e tag [a-z0-9-] ate 16 caracteres");
+    }
+    TAGS[id] = tag;
+    if (id === "plan" || id === "build") salvarTags();
+    note("tag " + id + " " + tag);
+    push();
+    res.writeHead(200);
+    return res.end("ok");
+  }
+
+  // historico do chat para abrir a pagina ja com as falas: /chat?n=50
+  if (url.pathname === "/chat") {
+    const pedido = parseInt(url.searchParams.get("n") || "50", 10) || 50;
+    const n = Math.max(1, Math.min(CHAT_MAX, pedido));
+    const body = JSON.stringify(CHAT.lista.slice(-n));
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Content-Length": Buffer.byteLength(body) });
+    return res.end(body);
   }
 
   // botoes da janela: ocultar e sempre por cima
@@ -959,8 +1079,8 @@ function start() {
   setInterval(() => { for (const r of clients) r.write(": ping\n\n"); }, 20000);
   setInterval(ccRefresh, 60000);
   // 127.0.0.1: so aceita conexoes da propria maquina
-  server.listen(PORT, "127.0.0.1", () =>
-    console.log(`Escritorio em http://localhost:${PORT} (ouvindo opencode na porta ${OC_PORT} e Claude Code em /claude)`));
+  server.listen(PORT, HOST, () =>
+    console.log(`Escritorio em http://localhost:${PORT} (${HOST}; ouvindo opencode na porta ${OC_PORT} e Claude Code em /claude)`));
   // celular: espera o Tailscale aparecer (ele pode ligar depois do servidor)
   const tentar = () => {
     if (!REMOTO || remoteServer) return;
@@ -975,4 +1095,5 @@ function start() {
 if (require.main === module) start();
 module.exports = { _setOpener: (fn) => { opener = fn; }, _setRemoto: (c) => { REMOTO = c; S.remoto = !!c; }, ligarRemoto,
   remoteServer: () => remoteServer, responder, setFora, S, server, handle, handleClaude, snapshot, setA, sseEvents,
+  fala, tags: () => ({ ...TAGS }), chat: () => CHAT.lista.slice(), _gravarChat: gravarChat, _dados: () => DADOS,
   sizes: () => ({ sessions: sessions.size, loggedParts: loggedParts.size, ccSubs: ccSubs.size, projects: projects.size }) };

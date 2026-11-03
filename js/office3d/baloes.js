@@ -11,7 +11,7 @@ export class Baloes {
     this.itens = new Map(); // id do ator -> { el, txt, nome }
   }
 
-  // garante um balao para o ator; info: { texto, nome, classe ('working'|'idle'...), cor }
+  // garante um balao para o ator; info: { texto, nome, tag, classe ('working'|'idle'...), cor }
   definir(ator, info) {
     let b = this.itens.get(ator.id);
     if (!b) {
@@ -20,15 +20,20 @@ export class Baloes {
       el.dataset.id = ator.id;
       const txt = document.createElement('span'); txt.className = 'txt';
       const nome = document.createElement('span'); nome.className = 'nome';
-      el.append(txt, nome);
+      const tag = document.createElement('span'); tag.className = 'tag';
+      el.append(txt, nome, tag);
       el.addEventListener('click', () => this.aoClicar(ator.id));
       this.camada.appendChild(el);
-      b = { el, txt, nome, ator };
+      b = { el, txt, nome, tag, ator };
       this.itens.set(ator.id, b);
     }
     b.ator = ator;
     if (b.txt.textContent !== info.texto) { b.txt.textContent = info.texto; b.txt.title = info.texto; }
     if (b.nome.textContent !== info.nome) b.nome.textContent = info.nome;
+    // badge de funcao: fica sob o nome, nunca dentro do balao
+    const t = info.tag || '';
+    if (b.tag.textContent !== t) b.tag.textContent = t;
+    b.tag.hidden = !t;
     const cls = 'balao ' + (info.classe || 'idle') + (info.texto ? '' : ' mini');
     if (b.el.className !== cls) b.el.className = cls;
     if (info.cor && b.el.style.getPropertyValue('--c') !== info.cor) b.el.style.setProperty('--c', info.cor);
@@ -52,7 +57,10 @@ export class Baloes {
       if (!visivel) continue;
       // longe da camera os baloes encolhem um pouco (sem sumir)
       const s = Math.max(0.85, Math.min(1.15, 18 / dist));
-      if (!b.w || b.mediuTxt !== b.txt.textContent + b.el.className) { b.w = b.el.offsetWidth; b.h = b.el.offsetHeight; b.mediuTxt = b.txt.textContent + b.el.className; }
+      if (!b.w || b.mediuTxt !== b.txt.textContent + b.el.className + b.tag.textContent + (b.tag.hidden ? 'h' : '')) {
+        b.w = b.el.offsetWidth; b.h = b.el.offsetHeight;
+        b.mediuTxt = b.txt.textContent + b.el.className + b.tag.textContent + (b.tag.hidden ? 'h' : '');
+      }
       vis.push({ b, x: (v.x * 0.5 + 0.5) * w, y: (-v.y * 0.5 + 0.5) * h, s, dist, w: b.w * s, h: b.h * s });
     }
     // empilha: quem esta mais perto da camera fica no lugar; quem cruzar com ele sobe

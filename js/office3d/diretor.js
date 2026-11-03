@@ -496,13 +496,15 @@ export class Diretor {
     if (a.papel === 'sub') {
       const s = a.sub || {};
       const texto = a.saindo || !a.sentado ? (a.atividade || 'chegando…') : (s.text || s.task || 'trabalhando…');
-      return { texto, nome: `${a.nome} · ${s.name || 'subagente'}`, classe: a.saindo ? 'done' : 'working', cor: COR_PAPEL.sub };
+      return { texto, nome: `${a.nome} · ${s.name || 'subagente'}`, tag: s.tag || '', classe: a.saindo ? 'done' : 'working', cor: COR_PAPEL.sub };
     }
     const st = a.estado || { status: 'idle' };
     const nome = `${NOME_PAPEL[a.papel]} · ${a.papel === 'plan' ? 'Plan' : 'Build'}`;
-    if (st.status === 'idle' && a.apoio) return { texto: this.textoApoio(a), nome, classe: 'working', cor: COR_PAPEL[a.papel] };
+    // a tag de plan/build vem do estado (o mundo nao le o agentes.tsv)
+    const tag = (this.estado && this.estado.tags && this.estado.tags[a.papel]) || '';
+    if (st.status === 'idle' && a.apoio) return { texto: this.textoApoio(a), nome, tag, classe: 'working', cor: COR_PAPEL[a.papel] };
     const texto = st.status === 'idle' ? (a.atividade || 'descansando…') : (st.text || (st.status === 'done' ? 'pronto!' : 'trabalhando…'));
-    return { texto, nome, classe: st.status, cor: COR_PAPEL[a.papel] };
+    return { texto, nome, tag, classe: st.status, cor: COR_PAPEL[a.papel] };
   }
 
   // ---------- telao com o painel ao vivo ----------

@@ -24,6 +24,10 @@ button.on { border-color: var(--ok); color: var(--ok) }
 .balao .txt { display: block; max-width: 260px; overflow: hidden; text-overflow: ellipsis; background: rgba(12, 14, 20, .86); border: 1.5px solid var(--c, var(--mut)); color: var(--ink);
   padding: 4px 10px; border-radius: 12px; font-size: 12px; box-shadow: 0 4px 14px rgba(0, 0, 0, .35); backdrop-filter: blur(4px) }
 .balao .nome { display: block; text-align: center; font-size: 10.5px; font-weight: 600; color: var(--c, var(--mut)); margin-top: 2px; text-shadow: 0 1px 3px #000; letter-spacing: .02em }
+/* badge de funcao: uma pilula pequena sob o nome, fora do texto do balao */
+.balao .tag { display: block; width: max-content; margin: 3px auto 0; padding: 0 6px; font-size: 9px; line-height: 14px; font-weight: 600; letter-spacing: .04em; color: var(--c, var(--mut)); background: rgba(12, 14, 20, .9); border: 1px solid var(--c, var(--mut)); border-radius: 999px; text-shadow: none }
+.balao .tag[hidden] { display: none }
+.balao.mini .tag { margin-top: 2px }
 .balao.idle .txt { opacity: .75; color: var(--mut) }
 .balao.waiting .txt { border-color: var(--warn); color: var(--warn); animation: pulso 1s ease-in-out infinite }
 .balao.error .txt { border-color: var(--err); color: var(--err) }
@@ -77,7 +81,21 @@ body.painel-min #painel .bar, body.painel-min #corpo { display: none }
 #subsList li.done { opacity: .5 } #subsList li.done i { background: var(--mut); box-shadow: none }
 #subsList b { flex: none; color: var(--sub); font-weight: 600 }
 #subsList small { flex: none; color: var(--mut) }
+#subsList small.tag { color: var(--sub); background: rgba(61, 220, 151, .1); border: 1px solid rgba(61, 220, 151, .3); border-radius: 999px; padding: 0 5px; font-size: 10px; line-height: 14px }
+#subsList small.tag[hidden] { display: none }
 #subsList span { overflow: hidden; text-overflow: ellipsis; color: var(--ink) }
+/* chat: historico rolavel dos baloes */
+#chatBox h5 { display: flex; align-items: center; gap: 8px }
+#chatFiltro { margin-left: auto; max-width: 140px; padding: 1px 4px; font-size: 11px; color: var(--ink); background: rgba(0, 0, 0, .3); border: 1px solid var(--line); border-radius: 7px }
+#chatList { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; font-size: 12px; max-height: 168px; overflow-y: auto; overscroll-behavior: contain }
+#chatList li { display: flex; align-items: baseline; gap: 5px; min-width: 0 }
+#chatList li[hidden] { display: none }
+#chatList time { flex: none; font-variant-numeric: tabular-nums; color: var(--mut); opacity: .75 }
+#chatList .kind { flex: none; width: auto; height: auto; background: none; box-shadow: none; font-size: 11px }
+#chatList b { flex: none; color: var(--sub); font-weight: 600; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+#chatList small.tag { flex: none; color: var(--mut); border: 1px solid var(--line); border-radius: 999px; padding: 0 5px; font-size: 9.5px; line-height: 14px }
+#chatList small.tag[hidden] { display: none }
+#chatList span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink) }
 #skillsList { display: flex; flex-wrap: wrap; gap: 4px }
 .skill { background: rgba(255, 122, 217, .1); border: 1px solid rgba(255, 122, 217, .3); color: #ffb3ea; border-radius: 999px; padding: 1px 8px; font-size: 11.5px; white-space: nowrap }
 .skill small { color: var(--mut) }

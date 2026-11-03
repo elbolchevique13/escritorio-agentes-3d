@@ -1,5 +1,10 @@
 // Utilitarios dos testes: sobe o servidor numa porta livre e faz requests "crus".
 process.env.OPEN_BROWSER = "0";
+// o chat e as tags gravam num diretorio temporario, nunca no repo
+const os = require("os");
+const fs = require("fs");
+const path = require("path");
+process.env.ESCRITORIO_DADOS = process.env.ESCRITORIO_DADOS || fs.mkdtempSync(path.join(os.tmpdir(), "escritorio-dados-"));
 const net = require("net");
 const app = require("../server.js");
 

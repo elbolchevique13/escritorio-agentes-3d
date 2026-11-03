@@ -13,6 +13,10 @@ const inicio = { plan: 0, build: 0 };
 let ultimaDur = 0, atual = null, acoesHud = {}, chavePedidos = '';
 const local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname); // no celular a janela do PC nao e controlada
 
+// icone do kind no chat (o mesmo kind que pinta o balao e o telao)
+const KIND_ICONE = { think: '💭', read: '📖', edit: '✏️', bash: '⌨️', search: '🔎', web: '🌐', wait: '✋', skill: '✨' };
+const chat = { ids: new Set(), slugs: new Map(), carregado: false };
+
 // chamado a cada estado novo (real ou do demo)
 export function mostrar(s) {
   atual = s;
@@ -47,6 +51,7 @@ export function mostrar(s) {
   pedidos(s.pedidos || []);
   subagentes(s.subs || []);
   skills(s.skills || [], s.now || Date.now());
+  falas(s.chat);
   tempo();
   janelaBotoes(s.janela);
   $('bFora').hidden = !s.remoto;
@@ -79,7 +84,7 @@ function pedidos(lista) {
   }
 }
 
-// cada subagente: nome do personagem, tipo e o que esta fazendo agora
+// cada subagente: nome do personagem, tipo, tag e o que esta fazendo agora
 function subagentes(subs) {
   const ul = $('subsList'); ul.textContent = '';
   $('subsBox').hidden = !subs.length;
@@ -88,10 +93,66 @@ function subagentes(subs) {
     const dot = document.createElement('i');
     const nome = document.createElement('b'); nome.textContent = (acoesHud.nomeSub && acoesHud.nomeSub(x.id)) || x.name;
     const tipo = document.createElement('small'); tipo.textContent = x.name;
+    const tag = document.createElement('small'); tag.className = 'tag'; tag.textContent = x.tag || ''; tag.hidden = !x.tag;
     const sp = document.createElement('span'); sp.textContent = x.status === 'done' ? 'pronto ✔' : (x.text || x.task || 'trabalhando…');
-    li.title = [x.task, x.text].filter(Boolean).join(' — ');
-    li.append(dot, nome, tipo, sp); ul.appendChild(li);
+    li.title = [x.tag, x.task, x.text].filter(Boolean).join(' — ');
+    li.append(dot, nome, tipo, tag, sp); ul.appendChild(li);
   }
+}
+
+// chat: os baloes viram historico com hora, nome, tag e o icone do kind
+function criarFala(x) {
+  const li = document.createElement('li');
+  li.dataset.id = String(x.id);
+  li.dataset.slug = x.slug || '';
+  const hora = document.createElement('time');
+  hora.textContent = x.hora || new Date(x.t || Date.now()).toTimeString().slice(0, 8);
+  const ic = document.createElement('i');
+  ic.className = 'kind'; ic.textContent = KIND_ICONE[x.kind] || '💭'; ic.title = x.kind || 'think';
+  const nome = document.createElement('b'); nome.textContent = x.nome || x.slug || '?';
+  const tag = document.createElement('small'); tag.className = 'tag'; tag.textContent = x.tag || ''; tag.hidden = !x.tag;
+  const txt = document.createElement('span'); txt.textContent = x.texto || ''; txt.title = x.texto || '';
+  li.append(hora, ic, nome, tag, txt);
+  return li;
+}
+
+function opcaoFiltro(slug, nome) {
+  const sel = $('chatFiltro');
+  const o = document.createElement('option');
+  o.value = slug; o.textContent = nome || slug;
+  sel.appendChild(o);
+}
+
+function filtrarChat() {
+  const f = $('chatFiltro').value;
+  for (const li of $('chatList').children) li.hidden = !!f && li.dataset.slug !== f;
+}
+
+// texto de agente entra por textContent: nada de innerHTML
+function falas(lista) {
+  if (!Array.isArray(lista) || !lista.length) return;
+  const box = $('chatBox'), ul = $('chatList');
+  const noFim = ul.scrollHeight - ul.scrollTop - ul.clientHeight < 12;
+  let novos = 0;
+  for (const x of lista) {
+    if (!x || x.id === undefined || chat.ids.has(x.id)) continue;
+    chat.ids.add(x.id);
+    ul.appendChild(criarFala(x));
+    if (!chat.slugs.has(x.slug)) { chat.slugs.set(x.slug, x.nome || x.slug); opcaoFiltro(x.slug, x.nome || x.slug); }
+    novos++;
+  }
+  while (ul.children.length > 200) ul.removeChild(ul.firstChild);
+  if (!novos) return;
+  box.hidden = false;
+  filtrarChat();
+  // acompanha o fim; se o usuario rolou para cima, respeita a leitura dele
+  if (noFim || !chat.carregado) ul.scrollTop = ul.scrollHeight;
+  chat.carregado = true;
+}
+
+// historico que ja existia quando a pagina abriu
+export function carregarChat() {
+  fetch('/chat?n=200').then((r) => (r.ok ? r.json() : [])).then(falas).catch(() => {});
 }
 
 // skills usadas por ultimo; a que acabou de ser chamada fica acesa
@@ -141,6 +202,8 @@ export function iniciarHud(acoes) {
   $('bPin').addEventListener('click', () => { const on = !$('bPin').classList.contains('on'); config.set('fixar', on); janela({ acao: 'fixar', on }); });
   $('bHide').addEventListener('click', () => janela({ acao: 'ocultar' }));
   $('bFora').addEventListener('click', () => fora(!$('bFora').classList.contains('on')));
+  $('chatFiltro').addEventListener('change', filtrarChat);
+  carregarChat();
 
   const CAMS = ['seguir', 'livre', 'cinema'];
   const bCam = $('bCam');
