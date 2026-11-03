@@ -2,3 +2,24 @@
 ✔ 12. 201 trechos no mesmo slug mantem 200 e o mais antigo sai (419.4618ms)
 ✔ 13. texto em branco responde ignorado e nao cria trecho (9.003ms)
 ✔ 14. hook do opencode: reasoning cria trecho com o texto real da parte (4.3982ms)
+✖ 15. snapshot tem as 3 chaves e o quadro novo chega por /events em menos de 500 ms (20007.0215ms)
+(node:29808) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ 19. tipo/kind invalidos -> 400; decision sem kind vira think sem res (11.1782ms)
+✔ 20. mundo-vivo: final_answer vira decision e commentary vira reasoning, os dois think (10.1888ms)
+✔ 21. GET /stream?slug preserva o tipo de cada trecho (18.8423ms)
+✔ 21b. GET /stream sem slug devolve todas as colunas; slug invalido -> 400 (11.138ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 1
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 21258.6663
+
+✖ failing tests:
+
+test at test\stream.test.js:116:1
+✖ 15. snapshot tem as 3 chaves e o quadro novo chega por /events em menos de 500 ms (20007.0215ms)
+  'test timed out after 20000ms'
